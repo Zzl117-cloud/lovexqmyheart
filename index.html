@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="theme-color" content="#000000" />
+<title>许晴我爱你 ♥ 3D 颗粒爱心</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: #000;               /* 纯黑空间背景 */
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
+  body { touch-action: none; }
+  canvas#scene {
+    display: block;
+    width: 100vw; height: 100vh;    /* 全屏铺满，界面里没有多余元素 */
+    background: #000;
+  }
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<script>
+/* ==========================================================================
+   3D 颗粒爱心 · “许晴我爱你”
+   - 爱心：隐函数 (x²+9/4y²+z²-1)³ - x²z³ - 9/80y²z³ = 0 采样 -> 实心圆滑立体
+   - 全部粒子为粉色，随三维旋转产生颗粒流动感，并持续闪烁
+   - 文字“许晴我爱你”同样是颗粒状、闪烁、有流动感
+   - 背景为纯黑，散布大量小粉色闪烁点
+   ========================================================================== */
+(function () {
+  'use strict';
+
+  /* ------------------------- 可自定义参数 ------------------------- */
+  var CONFIG = {
+    label: '许晴我爱你',        // 想改成别的名字，改这里即可
+    heartHues: [322, 328, 334, 340, 346],  // 爱心的粉色色相范围
+    textHues:  [326, 332, 338, 344, 350],  // 文字的粉色色相范围
+    bgHue:     334,             // 背景小点的粉色
+    heartParticleBase: 5000,    // 爱心颗粒基数（会按屏幕大小缩放）
+    bgDotCount: 900,            // 背景闪烁小点数量
+    spring: 0.075,              // 流动（回弹）速度
+    damping: 0.885,             // 阻尼，越小越黏（更像液体）
+    spin: 0.32,                 // 爱心自转速度（弧度/秒）
+    pointerRadius: 135          // 鼠标/手指推开粒子的半径
+  };
+
+  /* ------------------------- 画布与投影 ------------------------- */
+  var canvas = document.getElementById('scene');
+  var ctx = canvas.getContext('2d', { alpha: false });
+  var W = 0, H = 0, cx = 0, cy = 0, dpr = 1;
+  var FOCAL = 1000;             // 透视焦距（世界单位 = CSS 像素）
+
+  var pointer = { x: -9999, y: -9999, active: false };
+
+  /* ------------------------- 粉色光斑贴图 ------------------------- */
+  function makeSprite(hue) {
+    var size = 32, r = size / 2;
+    var c = document.createElement('canvas');
+    c.width = c.height = size;
+    var g = c.getContext('2d');
+    var grad = g.createRadialGradient(r, r, 0, r, r, r);
+    grad.addColorStop(0.00, 'hsla(' + hue + ',100%,92%,0.95)');
+    grad.addColorStop(0.18, 'hsla(' + hue + ',98%,78%,0.90)');
+    grad.addColorStop(0.42, 'hsla(' + hue + ',96%,62%,0.45)');
+    grad.addColorStop(0.72, 'hsla(' + hue + ',95%,55%,0.14)');
+    grad.addColorStop(1.00, 'hsla(' + hue + ',95%,55%,0)');
+    g.fillStyle = grad;
+    g.fillRect(0, 0, size, size);
+    return c;
+  }
+  var HEART_SPRITES = CONFIG.heartHues.map(makeSprite);
+  var TEXT_SPRITES  = CONFIG.textHues.map(makeSprite);
+  var BG_SPRITE     = makeSprite(CONFIG.bgHue);
+
+  /* ==========================================================================
+     一、3D 实心爱心：隐函数采样
+     方程取 (X² + 9/4Y² + Z² - 1)³ - X²Z³ - 9/80·Y²Z³ = 0
+     其中 Z 为竖直方向（上为正、下方为尖端），Y 为前后厚度方向。
+     ========================================================================== */
+  function inside(X, Y, Z) {
+    var a = X * X + 2.25 * Y * Y + Z * Z - 1;
+    return a * a * a - X * X * Z * Z * Z - 0.1125 * Y * Y * Z * Z * Z < 0;
+  }
+
+  // 从原点（一定在爱心内部）沿方向射线二分查找表面交点半径
+  function surfaceRadius(nx, ny, nz) {
+    var hi = 1.6;
+    var guard = 0;
+    while (inside(nx * hi, ny * hi, nz * hi) && guard++ < 12) hi *= 1.25;  // 保证外层为外部
+    var lo = 0;
+    for (var i = 0; i < 24; i++) {
+      var mid = (lo + hi) * 0.5;
+      if (inside(nx * mid, ny * mid, nz * mid)) lo = mid; else hi = mid;
+    }
+    return lo;
+  }
+
+  // 生成爱心点云：外层"壳" + 内部体积，得到圆滑的实心立体感
+  function buildHeart(count) {
+    var bx = new Float32Array(count);
+    var by = new Float32Array(count);
+    var bz = new Float32Array(count);
+    var minX = 9, maxX = -9, minY = 9, maxY = -9, minZ = 9, maxZ = -9;
+    var maxR = 0;                       // 水平面内最大半径（用于按透视放大预留布局余量）
+
+    var sh = new Uint8Array(count);
+    for (var i = 0; i < count; i++) {
+      var u = Math.random() * 2 - 1;
+      var th = Math.random() * Math.PI * 2;
+      var s = Math.sqrt(1 - u * u);
+      var nx = s * Math.cos(th), ny = s * Math.sin(th), nz = u;
+      var R = surfaceRadius(nx, ny, nz);
+      // 42% 贴在表面（轮廓清晰、圆滑），58% 填充内部（实心体积）
+      var isShell = Math.random() < 0.42;
+      var r = isShell
+        ? 0.86 + 0.14 * Math.random()
+        : 0.55 + 0.45 * Math.cbrt(Math.random());
+      sh[i] = isShell ? 1 : 0;
+      var X = nx * R * r, Y = ny * R * r, Z = nz * R * r;
+      bx[i] = X; by[i] = Y; bz[i] = Z;
+      var rr = Math.sqrt(X * X + Y * Y);
+      if (rr > maxR) maxR = rr;
+      if (X < minX) minX = X; if (X > maxX) maxX = X;
+      if (Y < minY) minY = Y; if (Y > maxY) maxY = Y;
+      if (Z < minZ) minZ = Z; if (Z > maxZ) maxZ = Z;
+    }
+    return {
+      n: count,
+      bx: bx, by: by, bz: bz, sh: sh,
+      cx: (minX + maxX) / 2, cy: (minY + maxY) / 2, cz: (minZ + maxZ) / 2,
+      w: maxX - minX, h: maxZ - minZ, d: maxY - minY, r: maxR
+    };
+  }
+
+  /* ------------------------- 粒子仓库 ------------------------- */
+  function rand(a, b) { return a + Math.random() * (b - a); }
+
+  var heart = null;      // buildHeart 结果 + 运行状态
+  var textSys = null;    // 文字粒子系统
+  var bg = null;         // 背景粉色小点
+  var quality = 1;       // 性能自适应系数
+
+  function initHeart(count) {
+    var geo = buildHeart(count);
+    geo.x = new Float32Array(count);
+    geo.y = new Float32Array(count);
+    geo.z = new Float32Array(count);
+    geo.vx = new Float32Array(count);
+    geo.vy = new Float32Array(count);
+    geo.vz = new Float32Array(count);
+    geo.ph = new Float32Array(count);
+    geo.sp = new Float32Array(count);
+    geo.sz = new Float32Array(count);
+    geo.hi = new Uint8Array(count);
+    geo.br = new Float32Array(count);
+    for (var i = 0; i < count; i++) {
+      // 起始时散落在空间中，随后流回爱心 -> 开场流动效果
+      geo.x[i] = (Math.random() - 0.5) * W * 1.6;
+      geo.y[i] = (Math.random() - 0.5) * H * 1.6;
+      geo.z[i] = (Math.random() - 0.5) * 900;
+      geo.ph[i] = Math.random() * Math.PI * 2;
+      geo.sp[i] = rand(1.5, 4.6);            // 闪烁速度
+      geo.sz[i] = rand(1.5, 3.1);            // 颗粒半径
+      geo.hi[i] = (Math.random() * CONFIG.heartHues.length) | 0;
+      geo.br[i] = rand(0.55, 1.0);           // 基础亮度
+    }
+    heart = geo;
+  }
+
+  function initBg(count) {
+    var n = count;
+    bg = {
+      n: n,
+      x: new Float32Array(n), y: new Float32Array(n), z: new Float32Array(n),
+      vx: new Float32Array(n), vy: new Float32Array(n),
+      ph: new Float32Array(n), sp: new Float32Array(n), sz: new Float32Array(n)
+    };
+    for (var i = 0; i < n; i++) scatterBgDot(i);
+    return bg;
+  }
+
+  // 背景粉色小点：按屏幕坐标均匀铺满整个界面，位于主体之后，缓慢漂移 + 闪烁
+  function scatterBgDot(i) {
+    var z = rand(220, 1700);
+    var p = FOCAL / (FOCAL + z);                 // 反投影，保证铺满屏幕
+    bg.z[i] = z;
+    bg.x[i] = ((Math.random() - 0.5) * W * 1.15) / p;
+    bg.y[i] = ((Math.random() - 0.5) * H * 1.15) / p;
+    bg.vx[i] = rand(-0.15, 0.15);
+    bg.vy[i] = rand(-0.12, 0.12);
+    bg.ph[i] = Math.random() * Math.PI * 2;
+    bg.sp[i] = rand(0.6, 3.4);
+    bg.sz[i] = rand(0.5, 1.9);
+  }
+
+
+  /* ==========================================================================
+     二、“许晴我爱你”：先把文字画到离屏画布，再按像素取样变成颗粒
+     ========================================================================== */
+  var TEXT_FONT_STACK = '"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans SC","Source Han Sans SC","WenQuanYi Micro Hei",sans-serif';
+
+  function buildText() {
+    var label = CONFIG.label;
+    var off = document.createElement('canvas');
+    var octx = off.getContext('2d');
+    function fontOf(size) { return '700 ' + size.toFixed(1) + 'px ' + TEXT_FONT_STACK; }
+
+    // 先按屏幕估算字号，再按实测宽度微调，保证完整显示
+    var fs = Math.max(18, Math.min(W * 0.90 / (label.length * 1.12), H * 0.15));
+    octx.font = fontOf(fs);
+    var tw = octx.measureText(label).width;
+    var maxW = W * 0.88;
+    if (tw > maxW) { fs *= maxW / tw; octx.font = fontOf(fs); tw = octx.measureText(label).width; }
+
+    var pad = Math.ceil(fs * 0.28);
+    var cw = Math.max(4, Math.ceil(tw) + pad * 2);
+    var ch = Math.max(4, Math.ceil(fs * 1.42) + pad * 2);
+    off.width = cw; off.height = ch;
+    octx.font = fontOf(fs);
+    octx.textAlign = 'center';
+    octx.textBaseline = 'middle';
+    octx.fillStyle = '#fff';
+    octx.fillText(label, cw / 2, ch / 2);
+
+    var data = octx.getImageData(0, 0, cw, ch).data;
+
+    function sample(step) {
+      var xs = [], ys = [];
+      for (var py = 0; py < ch; py += step) {
+        for (var px = 0; px < cw; px += step) {
+          if (data[(py * cw + px) * 4 + 3] > 128) {
+            xs.push(px + rand(-step * 0.5, step * 0.5));
+            ys.push(py + rand(-step * 0.5, step * 0.5));
+          }
+        }
+      }
+      return { xs: xs, ys: ys };
+    }
+
+    // 自适应取样密度，控制颗粒总数
+    var step = (fs > 90) ? 3 : 2;
+    var s = sample(step);
+    while (s.xs.length > 3200 && step < 7) { step++; s = sample(step); }
+    var n = s.xs.length;
+
+    var T = {
+      n: n, cw: cw, ch: ch, fs: fs,
+      ox: new Float32Array(n), oy: new Float32Array(n), oz: new Float32Array(n),
+      x: new Float32Array(n), y: new Float32Array(n), z: new Float32Array(n),
+      vx: new Float32Array(n), vy: new Float32Array(n), vz: new Float32Array(n),
+      ph: new Float32Array(n), sp: new Float32Array(n), sz: new Float32Array(n),
+      hi: new Uint8Array(n), br: new Float32Array(n)
+    };
+    for (var i = 0; i < n; i++) {
+      T.ox[i] = s.xs[i] - cw / 2;                 // 相对文字中心
+      T.oy[i] = s.ys[i] - ch / 2;
+      T.oz[i] = rand(-9, 9);                      // 轻微厚度，更有立体感
+      // 起始位置：从爱心附近散开，再流回字形
+      T.x[i] = (Math.random() - 0.5) * W * 1.2;
+      T.y[i] = (Math.random() - 0.5) * H * 0.9;
+      T.z[i] = rand(-500, 500);
+      T.ph[i] = Math.random() * Math.PI * 2;
+      T.sp[i] = rand(1.8, 5.2);                   // 闪烁速度
+      T.sz[i] = rand(1.2, 2.3);
+      T.hi[i] = (Math.random() * CONFIG.textHues.length) | 0;
+      T.br[i] = rand(0.8, 1.15);
+    }
+    T.textCY = 0;
+    textSys = T;
+  }
+
+  /* ==========================================================================
+     三、整体布局：爱心在上，文字在下，互不重叠、任何屏幕都完整可见
+     ========================================================================== */
+  function layout() {
+    var bottomMargin = H * 0.08;
+    var textBottom = H - bottomMargin;
+    var textCY = textBottom - textSys.ch / 2;
+    textSys.textCY = textCY;            // 文字中心的屏幕 Y
+
+    var heartTop = H * 0.05;
+    var heartBottomLimit = textCY - textSys.ch / 2 - H * 0.03;
+    var availH = Math.max(H * 0.10, heartBottomLimit - heartTop);
+
+    heartCY = heartTop + availH / 2;    // 爱心中心的屏幕 Y
+
+    // 投影时最靠前的颗粒会被放大 p = FOCAL/(FOCAL-z)，这里按最坏情况预留余量，
+    // 保证旋转到任何角度时爱心都完整落在 [heartTop, heartBottomLimit] 区间内。
+    var a = availH / heart.h;
+    var fitH = a * FOCAL / (FOCAL + a * heart.r);
+    var fitW = W * (W < H * 0.8 ? 0.80 : 0.62) / heart.w;   // 竖屏窄屏时爱心可以更宽，避免上下留白过多
+    heartScale = Math.min(fitH, fitW);
+  }
+
+  /* ==========================================================================
+     四、尺寸自适应
+     ========================================================================== */
+  var heartCY = 0, heartScale = 1;
+
+  function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    dpr = Math.min(window.devicePixelRatio || 1, 1.6);
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    cx = W / 2; cy = H / 2;
+    FOCAL = Math.max(700, Math.min(W, H) * 1.15);
+    if (heart) { buildText(); layout(); }   // 文字颗粒与布局跟随屏幕重新计算
+    if (bg) { for (var i = 0; i < bg.n; i++) scatterBgDot(i); }   // 背景小点重新铺满
+  }
+
+  /* ==========================================================================
+     五、渲染循环：弹簧 + 阻尼 -> 颗粒像液体一样流动、回弹、迟滞跟随
+     ========================================================================== */
+  var t = 0, rot = 0, last = 0, perfAcc = 0, perfFrames = 0;
+
+  function drawSprite(spr, sx, sy, r, alpha) {
+    if (alpha <= 0.01 || r <= 0.04) return;
+    ctx.globalAlpha = alpha > 1 ? 1 : alpha;
+    ctx.drawImage(spr, sx - r, sy - r, r * 2, r * 2);
+  }
+
+  function drawBackground(dt) {
+    var n = bg.n;
+    for (var i = 0; i < n; i++) {
+      bg.x[i] += bg.vx[i] * dt;
+      bg.y[i] += bg.vy[i] * dt;
+      var p = FOCAL / (FOCAL + bg.z[i]);
+      var sx = cx + bg.x[i] * p;
+      var sy = cy + bg.y[i] * p;
+      if (sx < -40 || sx > W + 40 || sy < -40 || sy > H + 40) { scatterBgDot(i); continue; }
+      var tw = 0.5 + 0.5 * Math.sin(t * bg.sp[i] + bg.ph[i]);
+      drawSprite(BG_SPRITE, sx, sy, bg.sz[i] * p * (0.8 + 1.0 * tw), 0.08 + 0.62 * tw * tw);
+    }
+  }
+
+  function drawHeart(dt) {
+    var G = heart, n = Math.floor(G.n * quality);
+    var cosA = Math.cos(rot), sinA = Math.sin(rot);
+    var s = heartScale * (1 + 0.022 * Math.sin(t * 0.85));      // 轻微呼吸感
+    var R = Math.max(1, s * 1.25);
+    var spring = CONFIG.spring, damp = Math.pow(CONFIG.damping, dt);
+    var pr = CONFIG.pointerRadius, pr2 = pr * pr;
+    var usePtr = pointer.active;
+    var ptrX = pointer.x - cx, ptrY = pointer.y - heartCY;   // 指针换算到以爱心中心为原点的坐标
+
+    for (var i = 0; i < n; i++) {
+      // 目标点：绕竖直轴旋转的三维爱心（坐标以爱心自身中心为原点）
+      var X = G.bx[i] - G.cx, Y = G.by[i] - G.cy, Z = G.bz[i] - G.cz;
+      var Xr = X * cosA - Y * sinA;
+      var Yr = X * sinA + Y * cosA;
+      var tx = Xr * s;
+      var ty = -Z * s;
+      var tz = Yr * s;
+
+      var x = G.x[i], y = G.y[i], z = G.z[i];
+      var vx = G.vx[i] + (tx - x) * spring * dt;
+      var vy = G.vy[i] + (ty - y) * spring * dt;
+      var vz = G.vz[i] + (tz - z) * spring * dt;
+
+      if (usePtr) {
+        var ddx = x - ptrX, ddy = y - ptrY;
+        var d2 = ddx * ddx + ddy * ddy;
+        if (d2 < pr2) {
+          var d = Math.sqrt(d2) || 0.0001;
+          var f = (1 - d / pr) * 30;
+          vx += ddx / d * f * dt;
+          vy += ddy / d * f * dt;
+          vz += 6 * dt;
+        }
+      }
+
+      vx *= damp; vy *= damp; vz *= damp;
+      x += vx; y += vy; z += vz;
+      G.vx[i] = vx; G.vy[i] = vy; G.vz[i] = vz;
+      G.x[i] = x; G.y[i] = y; G.z[i] = z;
+
+      var p = FOCAL / (FOCAL + z);
+      // 屏幕位置 = 爱心自身的屏幕中心 + 透视缩放后的偏移（爱心始终落在自己的布局区间里）
+      var sx = cx + x * p, sy = heartCY + y * p;
+      if (sx < -20 || sx > W + 20 || sy < -20 || sy > H + 20) continue;
+
+      var tw = 0.5 + 0.5 * Math.sin(t * G.sp[i] + G.ph[i]);
+      // 前亮后暗的深度着色 + 外壳更亮 -> 圆滑的实心立体感
+      var front = 1 - (tz / R) * 0.75;                 // 0.6(后) ~ 1.4(前)
+      var shade = (G.sh[i] ? 1.15 : 0.62) * front;
+      var a = G.br[i] * (0.28 + 0.72 * tw) * shade * 0.5;
+      var r = G.sz[i] * p * (0.8 + 0.45 * tw);
+      drawSprite(HEART_SPRITES[G.hi[i]], sx, sy, r, a);
+
+      if (tw > 0.985) drawSprite(HEART_SPRITES[G.hi[i]], sx, sy, r * 3.4, a * 0.35);  // 偶发大闪烁
+    }
+  }
+
+  function drawText(dt) {
+    var T = textSys, n = Math.floor(T.n * quality);
+    var spring = CONFIG.spring * 1.35, damp = Math.pow(CONFIG.damping + 0.02, dt);
+    var pr = CONFIG.pointerRadius, pr2 = pr * pr;
+    var usePtr = pointer.active;
+    var ptrX = pointer.x - cx, ptrY = pointer.y - T.textCY;   // 指针换算到以文字中心为原点的坐标
+
+    for (var i = 0; i < n; i++) {
+      // 目标点：字形 + 轻微波动的“液态”位移（坐标以文字自身中心为原点）
+      var tx = T.ox[i] + Math.sin(t * 1.1 - T.oy[i] * 0.022) * 2.2;
+      var ty = T.oy[i] + Math.cos(t * 1.5 + T.ox[i] * 0.03) * 1.6;
+      var tz = T.oz[i] + Math.sin(t * 1.7 + T.ph[i]) * 4;
+
+      var x = T.x[i], y = T.y[i], z = T.z[i];
+      var vx = T.vx[i] + (tx - x) * spring * dt;
+      var vy = T.vy[i] + (ty - y) * spring * dt;
+      var vz = T.vz[i] + (tz - z) * spring * dt;
+
+      if (usePtr) {
+        var ddx = x - ptrX, ddy = y - ptrY;
+        var d2 = ddx * ddx + ddy * ddy;
+        if (d2 < pr2) {
+          var d = Math.sqrt(d2) || 0.0001;
+          var f = (1 - d / pr) * 30;
+          vx += ddx / d * f * dt;
+          vy += ddy / d * f * dt;
+        }
+      }
+
+      vx *= damp; vy *= damp; vz *= damp;
+      x += vx; y += vy; z += vz;
+      T.vx[i] = vx; T.vy[i] = vy; T.vz[i] = vz;
+      T.x[i] = x; T.y[i] = y; T.z[i] = z;
+
+      var p = FOCAL / (FOCAL + z);
+      // 屏幕位置 = 文字自身的屏幕中心 + 透视缩放后的偏移
+      var sx = cx + x * p, sy = T.textCY + y * p;
+      if (sx < -20 || sx > W + 20 || sy < -20 || sy > H + 20) continue;
+
+      var tw = 0.5 + 0.5 * Math.sin(t * T.sp[i] + T.ph[i]);
+      var shimmer = 0.78 + 0.22 * Math.sin(t * 2.1 - T.ox[i] * 0.035);   // 横向流动的流光
+      var a = T.br[i] * (0.34 + 0.66 * tw) * shimmer * 0.52;
+      var r = T.sz[i] * p * (0.85 + 0.4 * tw);
+      drawSprite(TEXT_SPRITES[T.hi[i]], sx, sy, r, a);
+
+      if (tw > 0.985) drawSprite(TEXT_SPRITES[T.hi[i]], sx, sy, r * 3.0, a * 0.4);
+    }
+  }
+
+  function frame(now) {
+    if (!last) last = now;
+    var ms = Math.min(50, now - last);
+    last = now;
+    var dt = ms / 16.6667;
+    t += ms / 1000;
+    rot += CONFIG.spin * (ms / 1000);
+
+    // 性能自适应：卡顿时自动降低绘制数量，保证流畅
+    perfAcc += ms; perfFrames++;
+    if (perfFrames >= 45) {
+      var avg = perfAcc / perfFrames;
+      perfAcc = 0; perfFrames = 0;
+      if (avg > 26 && quality > 0.45) quality = Math.max(0.45, quality - 0.12);
+      else if (avg < 15 && quality < 1) quality = Math.min(1, quality + 0.05);
+    }
+
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = '#000';                         // 纯黑空间背景
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalCompositeOperation = 'lighter';       // 粉色颗粒叠加发光
+
+    drawBackground(dt);
+    drawHeart(dt);
+    drawText(dt);
+
+    requestAnimationFrame(frame);
+  }
+
+  /* ==========================================================================
+     六、交互与启动
+     ========================================================================== */
+  function onPointerMove(e) {
+    pointer.active = true;
+    pointer.x = e.clientX;              // 屏幕像素坐标，绘制时再换算到各自局部坐标
+    pointer.y = e.clientY;
+  }
+  function onPointerEnd() { pointer.active = false; }
+
+  function boot() {
+    resize();                           // 先确定画布尺寸 W/H
+    var k = Math.max(0.42, Math.min(1.15, (W * H) / (1600 * 900)));
+    initHeart(Math.round(CONFIG.heartParticleBase * k));
+    buildText();
+    layout();
+    initBg(Math.round(CONFIG.bgDotCount * Math.max(0.5, Math.min(1.3, k))));
+    requestAnimationFrame(frame);
+  }
+
+  var resizeTimer = 0;
+  window.addEventListener('resize', function () {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(resize, 150);
+  });
+  window.addEventListener('pointermove', onPointerMove, { passive: true });
+  window.addEventListener('pointerdown', onPointerMove, { passive: true });
+  window.addEventListener('pointerup', onPointerEnd, { passive: true });
+  window.addEventListener('pointercancel', onPointerEnd, { passive: true });
+  window.addEventListener('pointerleave', onPointerEnd, { passive: true });
+  document.addEventListener('visibilitychange', function () { last = 0; });
+
+  // 等系统字体就绪后再取样，保证中文一字不差
+  if (document.fonts && document.fonts.ready) {
+    document.fonts.ready.then(boot, boot);
+  } else {
+    boot();
+  }
+})();
+</script>
+</body>
+</html>
